@@ -53,7 +53,7 @@ app.post('/addObstacle', (req, res) => {
     });
 });
 
-// Route proxy — forwards to Google Directions, keeps API key off the device
+// Route proxy — calls Google Routes API (new), keeps API key off the device
 // Android calls: GET /route?olat=...&olng=...&dlat=...&dlng=...
 app.get('/route', (req, res) => {
     const { olat, olng, dlat, dlng } = req.query;
@@ -74,39 +74,83 @@ app.get('/route', (req, res) => {
         });
     }
 
-    const googleUrl = `https://maps.googleapis.com/maps/api/directions/json`
-        + `?origin=${olat},${olng}`
-        + `&destination=${dlat},${dlng}`
-        + `&mode=driving`
-        + `&alternatives=false`
-        + `&key=${apiKey}`;
+    // Routes API (New) — POST request with JSON body
+    const body = JSON.stringify({
+        origin: {
+            location: { latLng: { latitude: parseFloat(olat), longitude: parseFloat(olng) } }
+        },
+        destination: {
+            location: { latLng: { latitude: parseFloat(dlat), longitude: parseFloat(dlng) } }
+        },
+        travelMode: 'DRIVE',
+        routingPreference: 'TRAFFIC_AWARE',
+        computeAlternativeRoutes: false,
+        polylineEncoding: 'ENCODED_POLYLINE'
+    });
 
-    https.get(googleUrl, (googleRes) => {
+    const options = {
+        hostname: 'routes.googleapis.com',
+        path: '/directions/v2:computeRoutes',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': apiKey,
+            // Only request the fields we need — reduces response size
+            'X-Goog-FieldMask': 'routes.legs.steps.polyline,routes.polyline,routes.legs.steps.startLocation,routes.legs.steps.endLocation'
+        }
+    };
+
+    const googleReq = https.request(options, (googleRes) => {
         let data = '';
 
         googleRes.on('data', chunk => { data += chunk; });
 
         googleRes.on('end', () => {
             try {
-                const parsed = JSON.parse(data);
-                // Forward Google's response as-is — Android already knows how to parse it
-                res.json(parsed);
+                const routesResponse = JSON.parse(data);
+
+                if (!routesResponse.routes || routesResponse.routes.length === 0) {
+                    return res.status(404).json({ status: 'ZERO_RESULTS', message: 'No route found' });
+                }
+
+                // Convert Routes API response to Directions API format
+                // so the Android app needs zero changes
+                const route = routesResponse.routes[0];
+
+                const steps = (route.legs || []).flatMap(leg =>
+                    (leg.steps || []).map(step => ({
+                        polyline: { points: step.polyline.encodedPolyline }
+                    }))
+                );
+
+                res.json({
+                    status: 'OK',
+                    routes: [{
+                        legs: [{ steps }],
+                        overview_polyline: { points: route.polyline.encodedPolyline }
+                    }]
+                });
+
             } catch (e) {
-                console.error('Failed to parse Google response:', e);
+                console.error('Failed to parse Routes API response:', e);
                 res.status(502).json({
                     status: 'UPSTREAM_ERROR',
                     message: 'Invalid response from Google'
                 });
             }
         });
+    });
 
-    }).on('error', (e) => {
-        console.error('Google Directions request failed:', e.message);
+    googleReq.on('error', (e) => {
+        console.error('Google Routes API request failed:', e.message);
         res.status(500).json({
             status: 'SERVER_ERROR',
-            message: 'Failed to reach Google Directions API'
+            message: 'Failed to reach Google Routes API'
         });
     });
+
+    googleReq.write(body);
+    googleReq.end();
 });
 
 // Health check
