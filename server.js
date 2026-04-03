@@ -53,104 +53,54 @@ app.post('/addObstacle', (req, res) => {
     });
 });
 
-// Route proxy — calls Google Routes API (new), keeps API key off the device
+// Route proxy — calls OSRM (free, no API key) and returns response to Android app.
+// The app calls this instead of OSRM directly, avoiding SSL issues on older Android devices.
 // Android calls: GET /route?olat=...&olng=...&dlat=...&dlng=...
 app.get('/route', (req, res) => {
     const { olat, olng, dlat, dlng } = req.query;
 
     if (!olat || !olng || !dlat || !dlng) {
         return res.status(400).json({
-            status: 'INVALID_REQUEST',
+            code: 'InvalidInput',
             message: 'Missing required params: olat, olng, dlat, dlng'
         });
     }
 
-    const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-    if (!apiKey) {
-        console.error('GOOGLE_MAPS_API_KEY is not set');
-        return res.status(500).json({
-            status: 'SERVER_ERROR',
-            message: 'Routing service is not configured'
-        });
-    }
+    // OSRM expects lng,lat order
+    const osrmUrl = `https://router.project-osrm.org/route/v1/driving/`
+        + `${olng},${olat};${dlng},${dlat}`
+        + `?overview=full&geometries=polyline&steps=true`;
 
-    // Routes API (New) — POST request with JSON body
-    const body = JSON.stringify({
-        origin: {
-            location: { latLng: { latitude: parseFloat(olat), longitude: parseFloat(olng) } }
-        },
-        destination: {
-            location: { latLng: { latitude: parseFloat(dlat), longitude: parseFloat(dlng) } }
-        },
-        travelMode: 'DRIVE',
-        routingPreference: 'TRAFFIC_AWARE',
-        computeAlternativeRoutes: false,
-        polylineEncoding: 'ENCODED_POLYLINE'
-    });
+    console.log('Calling OSRM:', osrmUrl);
 
-    const options = {
-        hostname: 'routes.googleapis.com',
-        path: '/directions/v2:computeRoutes',
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Goog-Api-Key': apiKey,
-            // Only request the fields we need — reduces response size
-            'X-Goog-FieldMask': 'routes.legs.steps.polyline,routes.polyline,routes.legs.steps.startLocation,routes.legs.steps.endLocation'
-        }
-    };
-
-    const googleReq = https.request(options, (googleRes) => {
+    https.get(osrmUrl, (osrmRes) => {
         let data = '';
 
-        googleRes.on('data', chunk => { data += chunk; });
+        osrmRes.on('data', chunk => { data += chunk; });
 
-        googleRes.on('end', () => {
+        osrmRes.on('end', () => {
             try {
-                const routesResponse = JSON.parse(data);
-
-                if (!routesResponse.routes || routesResponse.routes.length === 0) {
-                    return res.status(404).json({ status: 'ZERO_RESULTS', message: 'No route found' });
-                }
-
-                // Convert Routes API response to Directions API format
-                // so the Android app needs zero changes
-                const route = routesResponse.routes[0];
-
-                const steps = (route.legs || []).flatMap(leg =>
-                    (leg.steps || []).map(step => ({
-                        polyline: { points: step.polyline.encodedPolyline }
-                    }))
-                );
-
-                res.json({
-                    status: 'OK',
-                    routes: [{
-                        legs: [{ steps }],
-                        overview_polyline: { points: route.polyline.encodedPolyline }
-                    }]
-                });
-
+                const parsed = JSON.parse(data);
+                console.log('OSRM response code:', parsed.code);
+                // Forward OSRM response as-is — Android app already parses this format
+                res.json(parsed);
             } catch (e) {
-                console.error('Failed to parse Routes API response:', e);
+                console.error('Failed to parse OSRM response:', e.message);
+                console.error('Raw response:', data.substring(0, 300));
                 res.status(502).json({
-                    status: 'UPSTREAM_ERROR',
-                    message: 'Invalid response from Google'
+                    code: 'ParseError',
+                    message: 'Invalid response from OSRM'
                 });
             }
         });
-    });
 
-    googleReq.on('error', (e) => {
-        console.error('Google Routes API request failed:', e.message);
+    }).on('error', (e) => {
+        console.error('OSRM request failed:', e.message);
         res.status(500).json({
-            status: 'SERVER_ERROR',
-            message: 'Failed to reach Google Routes API'
+            code: 'ServerError',
+            message: 'Failed to reach routing server'
         });
     });
-
-    googleReq.write(body);
-    googleReq.end();
 });
 
 // Health check
